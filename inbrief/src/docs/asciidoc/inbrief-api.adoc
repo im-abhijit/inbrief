@@ -1,0 +1,255 @@
+= Inbrief API and Implementation Guide
+Abhijit Shankhdhar
+:doctype: book
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+
+== Overview
+
+Inbrief is a Spring Boot 3.5 application that exposes REST APIs to fetch and rank news articles from MongoDB and derive trending content aided by Redis geo + scoring. An LLM service (Gemini) helps convert natural language queries into structured query data and to generate article summaries.
+
+Back-end components:
+
+- `NewsController`: REST endpoints under `/api/v1/news/*`.
+- `NewsRetrievalService`: Read APIs aggregating repository calls and pagination cursors.
+- `QueryOrchestrationService`: Orchestrates LLM-assisted query parsing and relevance ranking.
+- `TrendingService` and `EventStreamingService`: Compute and store trending signals in Redis; provide nearby/trending lookups.
+- `NewsArticlesRepository`: MongoDB queries and document mapping.
+- `LLMQueryService` and `GeminiResponseParser`: Calls Gemini and parses responses.
+
+Error handling is standardized via `GlobalExceptionHandler`, returning `ApiResponse` with `ResultInfo` fields and `ResultCode` enums.
+
+== Common Models and Conventions
+
+- `NewsArticle`: Core article DTO with fields like `id`, `title`, `description`, `source`, `publicationDate`, `category`, `relevanceScore`, `latitude`, `longitude`, optional `llmSummary` and `textScore`.
+- `CursorPage<T>`: Cursor-based pagination wrapper with `items` and `nextCursor`.
+- Cursor strategy:
+  - For non-duplicate sort fields (e.g., `publication_date`), `nextCursor` is the last page item's `publicationDate` (string `yyyy-MM-dd'T'HH:mm:ss`).
+  - For duplicate sort fields (e.g., `relevance_score`), `nextCursor` is `<score>_<id>` to ensure strict ordering.
+
+== Response Envelope
+
+All endpoints return:
+
+`ApiResponse<T>` with:
+
+- `resultInfo` → `resultCodeId`, `resultMsg`, `resultStatus` (`SUCCESS`/`FAILURE`).
+- `data` → domain payload (`CursorPage<NewsArticle>` or list).
+
+== Endpoints
+
+=== GET /api/v1/news/category
+
+Parameters:
+
+- `name` (required): category name.
+- `limit` (optional, default 20): page size.
+- `cursor` (optional): last page cursor (`publicationDate`).
+
+Logic:
+
+1. Validate `name` non-blank; else 400 `BAD_REQUEST`.
+2. Repository: `findByCategory(name, cursor, limit)` → `publication_date < cursor` if provided.
+3. Build `CursorPage` with `nextCursor = lastItem.publicationDate` (if any).
+4. If empty page: return `SUCCESS` with `NO_MORE_ARTICLES` code; else `SUCCESS` with items.
+
+Implementation refs:
+
+- `NewsController.getByCategory`
+- `NewsRetrievalService.fetchByCategory`
+- `NewsArticlesRepository.findByCategory`
+
+=== GET /api/v1/news/source
+
+Parameters: `name`, `limit` (default 20), `cursor`.
+
+Logic mirrors category search, using `source_name` equality filter in Mongo:
+
+- `findBySource(source, cursor, limit)` with `publication_date < cursor` if provided.
+- Cursor is the last `publicationDate`.
+
+Refs:
+
+- `NewsController.getBySource`
+- `NewsRetrievalService.fetchBySource`
+- `NewsArticlesRepository.findBySource`
+
+=== GET /api/v1/news/score
+
+Parameters:
+
+- `score` (required): minimum relevance threshold (double).
+- `limit` (default 20), `cursor` (optional): composite `<lastScore>_<lastId>`.
+
+Logic:
+
+1. Parse cursor into `lastScore` and `lastId` if provided.
+2. Base filter `relevance_score > score`.
+3. If cursor set, add secondary filter: `relevance_score < lastScore OR (relevance_score == lastScore AND id < lastId)`.
+4. Sort: `relevance_score DESC, id DESC`.
+5. `nextCursor = lastItem.relevanceScore + "_" + lastItem.id`.
+
+Refs:
+
+- `NewsController.getByRelevanceScore`
+- `NewsRetrievalService.fetchByRelevanceScore`
+- `NewsArticlesRepository.findByRelevanceScore`
+
+=== GET /api/v1/news/search
+
+Parameters: `query` (required), `limit` (default 10), `cursor` (optional by `publicationDate`).
+
+Logic:
+
+1. Validate non-blank query.
+2. Repository performs Mongo text search: `{$text: {$search: query}}` with optional `publication_date < cursor`.
+3. Projection includes `metaTextScore("score")` and fields, sorted by `textScore`.
+4. The code maps `score` to `NewsArticle.textScore` for exposure.
+5. Cursor is last `publicationDate`.
+
+Refs:
+
+- `NewsController.findBySearch`
+- `NewsRetrievalService.fetchBySearch`
+- `NewsArticlesRepository.findBySearch`
+
+=== GET /api/v1/news/location
+
+Parameters:
+
+- `lat`, `lon` (required): user coordinate.
+- `radiusKm` (required): search radius in kilometers.
+- `limit` (default 10), `cursor` (optional, currently unused).
+
+Logic:
+
+1. Geo filter using MongoDB `nearSphere` on `location_point` with `<radiusKm * 1000>` meters.
+2. Sort by `publication_date DESC`.
+3. Cursor currently uses last `publicationDate` via the common non-duplicate strategy.
+
+Refs:
+
+- `NewsController.getByLocation`
+- `NewsRetrievalService.fetchByLocation`
+- `NewsArticlesRepository.findByLocation`
+
+=== GET /api/v1/news/trending
+
+Parameters: `lat`, `lon`, `radiusKm` (required).
+
+Logic:
+
+1. `TrendingService.getTrendingNearby` queries Redis GEO for nearby article IDs within radius, including distances.
+2. For each ID, fetch `volumeScore` from a ZSET and compute: `geoBoost = 1/(1+distanceKm)`.
+3. Pull recent event list `events:<articleId>`, decay by time: `sum(weight * exp(-lambda * ageMs))`.
+4. Final score: `(volumeScore + recencyFactor) * geoBoost`.
+5. Sort desc, limit to N, then fetch full `NewsArticle` from Mongo and annotate `distance` and `trendingScore`.
+
+Refs:
+
+- `NewsController.trendingNearMe`
+- `TrendingService.getTrendingNearby`
+- `NewsRetrievalService.findTrendingArticlesByLocation`
+
+=== GET /api/v1/news/query
+
+Parameters: `query` (required), `limit` (default 10), `cursor` (optional).
+
+Purpose: Natural language query orchestration.
+
+Logic:
+
+1. LLM call: `LLMQueryService.getQueryData(query)` prompts Gemini to return structured `QueryData`:
+   - `intent`: list of signals like `category`, `source`, `search`, `nearby`, `score`.
+   - Weighted groups for `categories`, `keywords`, `location`, `source`, with `globalWeight` and local `values` weights.
+2. For each intent/group present, fan out to underlying fetches:
+   - Category: for every category value → `fetchByCategory`.
+   - Source: for every source value → `fetchBySource`.
+   - Keywords: for every keyword value → `fetchBySearch`.
+   - Nearby: placeholder for location-based fetch if provided.
+3. De-duplicate by article `id`.
+4. Rank: `base relevanceScore` + weighted matches from categories, sources, and textual keyword matches using the LLM-provided `globalWeight * localWeight` aggregation.
+5. Sort by composite rank desc, then `publicationDate` desc; limit to `limit`.
+6. Cursor: last item `publicationDate` string.
+
+Refs:
+
+- `NewsController.queryNews`
+- `QueryOrchestrationService.executeQuery`
+- `LLMQueryService`, `GeminiResponseParser`, `QueryData`, `AttributeData`
+
+=== GET /api/v1/news/populate
+
+Parameters: none.
+
+Logic:
+
+1. Iterate all Mongo articles, generate a summary string (currently using `title + "." + description` as a placeholder; LLM call present but commented) and store to `llm_summary` via `NewsArticlesRepository.addSummaryToDoc`.
+2. Returns a simple confirmation.
+
+Refs:
+
+- `NewsController.populateSummary`
+- `QueryOrchestrationService.populateSummary`
+
+== Error Handling
+
+- `BadRequestException`, `NotFoundException`, `ServiceUnavailableException` are mapped to standardized `ApiResponse` with appropriate `ResultCode` and HTTP status in `GlobalExceptionHandler`.
+- Unknown exceptions → 500 with `INTERNAL_ERROR`.
+
+== Data Access Details
+
+- MongoDB database: `inbrief`, collection: `news_articles`.
+- Important fields used:
+  - `id` (string), `title`, `description`, `url`, `source_name`, `publication_date` (date), `category` (array), `relevance_score` (double), `latitude`, `longitude`, `location_point` (GeoJSON), `llm_summary`.
+- Repository utilities:
+  - Cursor handling via `DateParser` to convert between string and `Date`.
+  - `NewsArticle.fromDocument` maps Mongo `Document` to DTO.
+
+== Redis Structures for Trending
+
+- GEO set: `geo:articles` stores article IDs geo-located by `lon, lat`.
+- ZSET: `score:articles` stores cumulative volume scores (views/clicks/shares).
+- LIST per article: `events:<id>` stores recent `EventData(type, weight, timestamp)` serialized JSON.
+- Optional grid pre-computation: `trending:<latGrid>:<lonGrid>` stores ZSET of top IDs per grid; `article:<id>` stores serialized meta `{score, distance}` for fast reads.
+
+== LLM Integration
+
+- Endpoint: Google Gemini `gemini-2.5-flash:generateContent` via HTTP.
+- Query parsing prompt enforces JSON schema with weighted groups, totals summing to 1.0 at both global and local levels.
+- Summary prompt targets concise summaries (< ~80 words) used for `llm_summary`.
+- Failures surface as `ServiceUnavailableException` mapped to 503.
+
+== Pagination Cheat Sheet
+
+- Category/Source/Search/Location: `nextCursor = lastItem.publicationDate`.
+- Score: `nextCursor = lastItem.relevanceScore + "_" + lastItem.id`.
+
+== Example Requests
+
+Category:
+
+----
+GET /api/v1/news/category?name=technology&limit=20
+----
+
+Relevance score:
+
+----
+GET /api/v1/news/score?score=0.8&limit=20&cursor=0.92_abc123
+----
+
+Search:
+
+----
+GET /api/v1/news/search?query=quantum%20computing&limit=10
+----
+
+Trending near me:
+
+----
+GET /api/v1/news/trending?lat=19.07&lon=72.88&radiusKm=25
+----
+
